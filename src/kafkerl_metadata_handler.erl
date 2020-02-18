@@ -1,17 +1,22 @@
 -module(kafkerl_metadata_handler).
 -author('hernanrivasacosta@gmail.com').
 
--behaviour(gen_fsm).
+-behaviour(gen_statem).
 
 %% API
 -export([request_metadata/1, get_known_topics/0]).
 %% States
--export([idle/2, requesting/2, on_cooldown/2]).
+-export([idle/3, requesting/3, on_cooldown/3]).
 %% Internal
 -export([make_request/3]).
-%% gen_fsm
--export([start_link/1, init/1, handle_info/3, terminate/3, code_change/4,
-    handle_event/3, handle_sync_event/4]).
+%% gen_statem
+-export([
+    start_link/1,
+    init/1,
+    terminate/3,
+    code_change/4,
+    callback_mode/0
+]).
 
 -include("kafkerl.hrl").
 -type broker_id() :: non_neg_integer().
@@ -34,21 +39,21 @@
 %%==============================================================================
 -spec start_link(any()) -> {ok, pid()} | ignore | kafkerl:error().
 start_link(Config) ->
-    gen_fsm:start_link({local, ?MODULE}, ?MODULE, [Config], []).
+    gen_statem:start_link({local, ?MODULE}, ?MODULE, [Config], []).
 
 -spec request_metadata([kafkerl:topic()]) -> ok.
 request_metadata(Topics) ->
-    gen_fsm:send_event(?MODULE, {request, Topics}).
+    gen_statem:cast(?MODULE, {request, Topics}).
 
 -spec get_known_topics() -> ok.
 get_known_topics() ->
-    gen_fsm:sync_send_all_state_event(?MODULE, get_known_topics).
+    gen_statem:call(?MODULE, get_known_topics).
 
 %%==============================================================================
 %% States
 %%==============================================================================
--spec idle(any(), state()) -> {next_state, atom(), state()}.
-idle({request, Topics}, State = #state{known_topics = KnownTopics}) ->
+-spec idle({call, {pid(), term()}} | cast | info, any(), state()) -> {next_state, atom(), state()}.
+idle(cast, {request, Topics}, State = #state{known_topics = KnownTopics}) ->
     % Add the requested topics to the state
     SortedTopics = lists:usort(KnownTopics),
     NewKnownTopics = lists:umerge(Topics, SortedTopics),
@@ -56,11 +61,13 @@ idle({request, Topics}, State = #state{known_topics = KnownTopics}) ->
     % Make the request
     ok = schedule_metadata_request(NewState),
     % And move the the requesting state
-    {next_state, requesting, NewState}.
+    {next_state, requesting, NewState};
+idle(EventType, EventContent, Data) ->
+    handle_common(EventType, EventContent, Data).
 
--spec requesting(any(), state()) -> {next_state, atom(), state()}.
+-spec requesting({call, {pid(), term()}} | cast | info, any(), state()) -> {next_state, atom(), state()}.
 % Handle a new metadata request while there's one in progress
-requesting({request, NewTopics}, State = #state{known_topics = KnownTopics}) ->
+requesting(cast, {request, NewTopics}, State = #state{known_topics = KnownTopics}) ->
     SortedTopics = lists:usort(NewTopics), % This also removes repeated entries
     % If the request is for known topics, then we can safely ignore it, otherwise,
     % queue a metadata request
@@ -72,7 +79,7 @@ requesting({request, NewTopics}, State = #state{known_topics = KnownTopics}) ->
                end,
     {next_state, requesting, NewState};
 % Handle the updated metadata
-requesting({metadata_updated, RawMapping}, State) ->
+requesting(cast, {metadata_updated, RawMapping}, State) ->
     % Create the topic mapping (this also starts the broker connections)
     {N, TopicMapping} = get_broker_mapping(RawMapping, State),
     OldMapping = State#state.broker_connections,
@@ -93,49 +100,51 @@ requesting({metadata_updated, RawMapping}, State) ->
     timer:apply_after(?METADATA_REFRESH_INTERVAL, ?MODULE, request_metadata, [[]]),
     {next_state, idle, NewState};
 % If we have no more retries left, go on cooldown
-requesting({metadata_retry, 0}, State = #state{cooldown = Cooldown}) ->
+requesting(cast, {metadata_retry, 0}, State = #state{cooldown = Cooldown}) ->
     Params = [?MODULE, on_timer],
-    {ok, _} = timer:apply_after(Cooldown, gen_fsm, send_event, Params),
+    {ok, _} = timer:apply_after(Cooldown, gen_statem, cast, Params),
     {next_state, on_cooldown, State};
 % If we have more retries to do, schedule a new retry
-requesting({metadata_retry, Retries}, State) ->
+requesting(cast, {metadata_retry, Retries}, State) ->
     ok = schedule_metadata_request(Retries, State),
-    {next_state, requesting, State}.
+    {next_state, requesting, State};
+requesting(EventType, EventContent, Data) ->
+    handle_common(EventType, EventContent, Data).
 
--spec on_cooldown(any(), state()) -> {next_state, atom(), state()}.
-on_cooldown({request, NewTopics}, State = #state{known_topics = KnownTopics}) ->
+-spec on_cooldown({call, {pid(), term()}} | cast | info, any(), state()) -> {next_state, atom(), state()}.
+on_cooldown(cast, {request, NewTopics}, State = #state{known_topics = KnownTopics}) ->
     % Since we are on cooldown (the time between consecutive requests) we only add
     % the topics to the scheduled next request
     SortedTopics = lists:usort(NewTopics),
     State#state{known_topics = lists:umerge(KnownTopics, SortedTopics)};
-on_cooldown(on_timer, State) ->
+on_cooldown(cast, on_timer, State) ->
     ok = schedule_metadata_request(State),
-    {next_state, requesting, State}.
+    {next_state, requesting, State};
+on_cooldown(EventType, EventContent, Data) ->
+    handle_common(EventType, EventContent, Data).
 
 %%==============================================================================
-%% Events
+%% Common events
 %%==============================================================================
-handle_sync_event(get_known_topics, _From, StateName, State) ->
+handle_common({call, From}, get_known_topics, State) ->
     Reply = State#state.known_topics,
-    {reply, Reply, StateName, State}.
-
-%%==============================================================================
-%% gen_fsm boilerplate
-%%==============================================================================
--spec handle_info(any(), atom(), state()) -> {next_state, atom(), state()}.
-handle_info({'EXIT', Pid, Reason}, StateName, State) ->
+    {keep_state, State, [{reply, From, Reply}]};
+handle_common(info, {'EXIT', Pid, Reason}, State) ->
     lager:info("process ~p crashed with reason ~p ", [Pid, Reason]),
     BrokerConnections = [{Name, {Topic, Partition}, Conn} || {Name, {Topic, Partition}, Conn} <- State#state.broker_connections,
         whereis(Conn) /= Pid, whereis(Conn) /= undefined],
     lager:debug("current connections ~p, updated connections ~p ~n", [State#state.broker_connections, BrokerConnections]),
     timer:apply_after(1000, ?MODULE, request_metadata, [[]]),
-    {next_state, StateName, State#state{broker_connections = BrokerConnections}};
-
-handle_info(Message, StateName, State) ->
+    {keep_state, State#state{broker_connections = BrokerConnections}};
+handle_common(info, Message, State) ->
     lager:info("received unexpected message ~p", [Message]),
-    {next_state, StateName, State}.
+    {keep_state, State};
+handle_common(cast, _Message, State) ->
+    {keep_state, State}.
 
-
+%%==============================================================================
+%% gen_statem boilerplate
+%%==============================================================================
 -spec code_change(any(), atom(), state(), any()) -> {ok, atom(), state()}.
 code_change(_OldVsn, StateName, StateData, _Extra) ->
     {ok, StateName, StateData}.
@@ -144,14 +153,9 @@ code_change(_OldVsn, StateName, StateData, _Extra) ->
 terminate(_Reason, _StateName, _StateData) ->
     ok.
 
--spec handle_event(any(), atom(), state()) -> {next_state, atom(), state()}.
-handle_event(_Event, StateName, StateData) ->
-    {next_state, StateName, StateData}.
-
-%-spec handle_sync_event(any(), any(), atom(), state()) ->
-%  {next_state, atom(), state()}.
-%handle_sync_event(_Event, _From, StateName, StateData) ->
-%  {next_state, StateName, StateData}.
+-spec callback_mode() -> state_functions.
+callback_mode() ->
+    state_functions.
 
 %%==============================================================================
 %% Handlers
@@ -205,11 +209,11 @@ schedule_metadata_request(Retries, State = #state{brokers = Brokers,
 make_request(Brokers, Request, Retries) ->
     case do_request_metadata(Brokers, Request) of
         {ok, TopicMapping} ->
-            gen_fsm:send_event(?MODULE, {metadata_updated, TopicMapping});
+            gen_statem:cast(?MODULE, {metadata_updated, TopicMapping});
         Error ->
             _ = lager:debug("Metadata request error: ~p", [Error]),
             NewRetries = case Retries of -1 -> -1; _ -> Retries - 1 end,
-            gen_fsm:send_event(?MODULE, {metadata_retry, NewRetries})
+            gen_statem:cast(?MODULE, {metadata_retry, NewRetries})
     end.
 
 do_request_metadata([], _Request) ->
