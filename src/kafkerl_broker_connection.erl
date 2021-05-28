@@ -31,6 +31,7 @@
     client_id = undefined :: binary(),
     socket = undefined :: port(),
     address = undefined :: kafkerl_connector:address(),
+    is_https = true :: boolean(),
     tref = undefined :: any(),
     tcp_options = [] :: [any()],
     max_retries = 0 :: integer(),
@@ -101,8 +102,8 @@ handle_call({stop_fetch, Topic, Partition}, _From, State) ->
     handle_stop_fetch(Topic, Partition, State).
 
 -spec handle_info(any(), state()) -> {noreply, state()}.
-handle_info({connected, Socket}, State) ->
-    handle_flush(State#state{socket = Socket});
+handle_info({connected, Socket, IsHttps}, State) ->
+    handle_flush(State#state{socket = Socket, is_https = IsHttps});
 handle_info(connection_timeout, State) ->
     {stop, {error, unable_to_connect}, State};
 handle_info({tcp_closed, _Socket}, State = #state{}) ->
@@ -167,7 +168,7 @@ handle_flush(State = #state{socket = undefined}) ->
 handle_flush(State = #state{buffers = [], name = Name}) ->
     lager:error("process have connection to broker but no buffer binding!! kill me ~p", [Name]),
     {noreply, State};
-handle_flush(State = #state{ets = EtsName, socket = Socket, buffers = Buffers,
+handle_flush(State = #state{ets = EtsName, socket = Socket, is_https = IsHttps,buffers = Buffers,
     name = Name, client_id = ClientId}) ->
     {ok, CorrelationId, NewState} = build_correlation_id(State),
     % TODO: Maybe buffer all this messages in case something goes wrong
@@ -181,11 +182,11 @@ handle_flush(State = #state{ets = EtsName, socket = Socket, buffers = Buffers,
                 CorrelationId),
             true = ets:insert_new(EtsName, {CorrelationId, MergedMessages}),
             _ = lager:debug("~p sending ~p", [Name, Request]),
-            case gen_tcp:send(Socket, Request) of
+            case kafkerl_utils:send(Socket, Request, IsHttps) of
                 {error, Reason} ->
                     _ = lager:critical("~p was unable to write to socket, reason: ~p",
                         [Name, Reason]),
-                    gen_tcp:close(Socket),
+                    kafkerl_utils:close(Socket, IsHttps),
                     ets:delete_all_objects(EtsName, CorrelationId),
                     ok = resend_messages(MergedMessages),
                     {noreply, handle_tcp_close(NewState)};
@@ -197,7 +198,7 @@ handle_flush(State = #state{ets = EtsName, socket = Socket, buffers = Buffers,
 
 handle_fetch(ServerRef, Topic, Partition, Options,
     State = #state{fetches = Fetches, client_id = ClientId,
-        socket = Socket, name = Name,
+        socket = Socket, is_https = IsHttps,name = Name,
         scheduled_fetches = ScheduledFetches}) ->
     Scheduled = proplists:get_bool(scheduled, Options),
     case {get_fetch(Topic, Partition, Fetches),
@@ -226,11 +227,11 @@ handle_fetch(ServerRef, Topic, Partition, Options,
                 CorrelationId,
                 MaxWait,
                 MinBytes),
-            case gen_tcp:send(Socket, Payload) of
+            case kafkerl_utils:send(Socket, Payload, IsHttps) of
                 {error, Reason} ->
                     _ = lager:critical("~p was unable to write to socket, reason: ~p",
                         [Name, Reason]),
-                    ok = gen_tcp:close(Socket),
+                    ok = kafkerl_utils:close(Socket, IsHttps),
                     {reply, {error, no_connection}, handle_tcp_close(State)};
                 ok ->
                     _ = lager:debug("~p sent request ~p", [Name, CorrelationId]),
@@ -474,12 +475,12 @@ connect(Pid, Name, _TCPOpts, {Host, Port} = _Address, _Timeout, 0) ->
     Pid ! connection_timeout;
 connect(Pid, Name, TCPOpts, {Host, Port} = Address, Timeout, Retries) ->
     _ = lager:debug("~p attempting connection to ~p:~p", [Name, Host, Port]),
-    case gen_tcp:connect(Host, Port, TCPOpts, 5000) of
-        {ok, Socket} ->
+    case kafkerl_utils:connect(Host, Port, TCPOpts, 5000) of
+        {{ok, Socket}, IsHttps} ->
             _ = lager:debug("~p connnected to ~p:~p", [Name, Host, Port]),
-            gen_tcp:controlling_process(Socket, Pid),
-            Pid ! {connected, Socket};
-        {error, Reason} ->
+            kafkerl_utils:controlling_process(Socket, Pid, IsHttps),
+            Pid ! {connected, Socket, IsHttps};
+        {{error, Reason}, _} ->
             NewRetries = Retries - 1,
             _ = lager:warning("~p unable to connect to ~p:~p. Reason: ~p
                          (~p retries left)",

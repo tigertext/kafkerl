@@ -217,27 +217,27 @@ do_request_metadata([], _Request) ->
 do_request_metadata([{Host, Port} = _Broker | T], Request) ->
     _ = lager:debug("Attempting to connect to broker at ~s:~p", [Host, Port]),
     % Connect to the Broker
-    case gen_tcp:connect(Host, Port, get_metadata_tcp_options()) of
-        {error, Reason} ->
+    case kafkerl_utils:connect(Host, Port, get_metadata_tcp_options()) of
+        {{error, Reason}, _IsHttps} ->
             log_metadata_request_error(Host, Port, Reason),
             % Failed, try with the next one in the list
             do_request_metadata(T, Request);
-        {ok, Socket} ->
+        {{ok, Socket}, IsHttps} ->
             % On success, send the metadata request
-            case gen_tcp:send(Socket, Request) of
+            case kafkerl_utils:send(Socket, Request, IsHttps) of
                 {error, Reason} ->
                     log_metadata_request_error(Host, Port, Reason),
                     % Unable to send request, try the next broker
                     do_request_metadata(T, Request);
                 ok ->
-                    case gen_tcp:recv(Socket, 0, 6000) of
+                    case kafkerl_utils:recv(Socket, 0, 6000, IsHttps) of
                         {error, Reason} ->
                             log_metadata_request_error(Host, Port, Reason),
-                            gen_tcp:close(Socket),
+                            kafkerl_utils:close(Socket, IsHttps),
                             % Nothing received (probably a timeout), try the next broker
                             do_request_metadata(T, Request);
                         {ok, Data} ->
-                            gen_tcp:close(Socket),
+                            kafkerl_utils:close(Socket, IsHttps),
                             case kafkerl_protocol:parse_metadata_response(Data) of
                                 {error, Reason} ->
                                     log_metadata_request_error(Host, Port, Reason),

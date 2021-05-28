@@ -7,6 +7,14 @@
 -export([buffer_name/2, default_buffer_name/0]).
 -export([gather_consume_responses/0, gather_consume_responses/1]).
 -export([proplists_set/2]).
+-export([
+    connect/3,
+    connect/4,
+    send/3,
+    recv/4,
+    close/2,
+    controlling_process/3
+]).
 
 %%==============================================================================
 %% API
@@ -77,6 +85,40 @@ proplists_set(Proplist, []) ->
 proplists_set(Proplist, [H | T]) ->
   proplists_set(proplists_set(Proplist, H), T).
 
+connect(Host, Port, Options) ->
+    connect(Host, Port, Options, infinity).
+
+connect(Host, 9092, Options, Timeout) ->
+    {gen_tcp:connect(Host, 9092, Options, Timeout), false};
+connect(Host, 9094, Options, Timeout) ->
+    {ssl:connect(Host, 9094, Options, Timeout), true};
+connect(Host, Port, Options, Timeout) ->
+    case ssl:connect(Host, Port, Options, Timeout) of
+        {ok, _} = R->
+            {R, true};
+        _ ->
+            {gen_tcp:connect(Host, Port, Options, Timeout), false}
+  end.
+
+send(Socket, Request, true) ->
+    ssl:send(Socket, Request);
+send(Socket, Request, false) ->
+    gen_tcp:send(Socket, Request).
+
+recv(Socket, Length, Timeout, true) ->
+    ssl:recv(Socket, Length, Timeout);
+recv(Socket, Length, Timeout, false) ->
+    gen_tcp:recv(Socket, Length, Timeout).
+
+close(Socket, false) ->
+    gen_tcp:close(Socket);
+close(Socket, true) ->
+    ssl:close(Socket).
+
+controlling_process(Socket, Pid, false) ->
+    gen_tcp:controlling_process(Socket, Pid);
+controlling_process(Socket, Pid, true) ->
+    ssl:controlling_process(Socket, Pid).
 %%==============================================================================
 %% Utils
 %%==============================================================================
