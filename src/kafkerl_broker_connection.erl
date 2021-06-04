@@ -106,11 +106,13 @@ handle_info({connected, Socket, IsHttps}, State) ->
     handle_flush(State#state{socket = Socket, is_https = IsHttps});
 handle_info(connection_timeout, State) ->
     {stop, {error, unable_to_connect}, State};
-handle_info({tcp_closed, _Socket}, State = #state{}) ->
-    NewState = handle_tcp_close(State),
+handle_info({Close, _Socket}, State = #state{})
+    when Close == tcp_closed; Close == ssl_closed->
+    NewState = handle_connection_close(State),
     {noreply, NewState};
-handle_info({tcp, _Socket, Bin}, State) ->
-    case handle_tcp_data(Bin, State) of
+handle_info({Connection, _Socket, Bin}, State)
+    when Connection == tcp; Connection == ssl->
+    case handle_connection_data(Bin, State) of
         {ok, NewState} -> {noreply, NewState};
         {error, Reason} -> {stop, {error, Reason}, State}
     end;
@@ -189,7 +191,7 @@ handle_flush(State = #state{ets = EtsName, socket = Socket, is_https = IsHttps,b
                     kafkerl_utils:close(Socket, IsHttps),
                     ets:delete_all_objects(EtsName, CorrelationId),
                     ok = resend_messages(MergedMessages),
-                    {noreply, handle_tcp_close(NewState)};
+                    {noreply, handle_connection_close(NewState)};
                 ok ->
                     _ = lager:debug("~p sent message ~p", [Name, CorrelationId]),
                     {noreply, NewState}
@@ -232,7 +234,7 @@ handle_fetch(ServerRef, Topic, Partition, Options,
                     _ = lager:critical("~p was unable to write to socket, reason: ~p",
                         [Name, Reason]),
                     ok = kafkerl_utils:close(Socket, IsHttps),
-                    {reply, {error, no_connection}, handle_tcp_close(State)};
+                    {reply, {error, no_connection}, handle_connection_close(State)};
                 ok ->
                     _ = lager:debug("~p sent request ~p", [Name, CorrelationId]),
                     NewFetch = #fetch{correlation_id = CorrelationId,
@@ -284,7 +286,7 @@ remove_fetch(Topic, Partition, Force, [H | T], Acc) ->
     remove_fetch(Topic, Partition, Force, T, [H | Acc]).
 
 % TCP Handlers
-handle_tcp_close(State = #state{retry_interval = RetryInterval,
+handle_connection_close(State = #state{retry_interval = RetryInterval,
     tcp_options = TCPOpts,
     max_retries = MaxRetries,
     address = Address,
@@ -293,7 +295,7 @@ handle_tcp_close(State = #state{retry_interval = RetryInterval,
     _Pid = spawn_link(?MODULE, connect, Params),
     State#state{socket = undefined}.
 
-handle_tcp_data(Bin, State = #state{fetches = Fetches,
+handle_connection_data(Bin, State = #state{fetches = Fetches,
     current_fetch = CurrentFetch}) ->
     {ok, CorrelationId, _NewBin} = parse_correlation_id(Bin, CurrentFetch),
     case get_fetch(CorrelationId, Fetches) of
